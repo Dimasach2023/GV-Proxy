@@ -1,0 +1,4 @@
+# Dead googlevideo nodes that should be redirected.
+# FULL addresses only, one per line (# starts a comment):
+#   rr3---sn-pivhx-n8vs.googlevideo.com
+# After changing this file, run menu item 1 (Install) again - it updates hosts.
