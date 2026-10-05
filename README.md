@@ -54,7 +54,7 @@ Firefox не использует системные сертификаты, п�
 
 ```
 rr3---sn-pivhx-n8vs.googlevideo.com    # один конкретный адрес
-rr*---sn-pivhx-n8vs.googlevideo.com    # этот узел на всех rr1..rr30
+rr*---sn-pivhx-n8vs.googlevideo.com    # этот узел на всех rr
 sn-pivhx-n8vs                          # короткая запись предыдущего варианта
 ```
 
