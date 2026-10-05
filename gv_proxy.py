@@ -378,13 +378,61 @@ def _strip_block(text: str):
 
 
 def _read_hosts() -> str:
-    return HOSTS.read_bytes().decode("latin-1")  # latin-1 = lossless for any bytes
+    raw = HOSTS.read_bytes()
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")) or b"\x00" in raw:
+        print("hosts is saved as UTF-16 or contains binary data. The script will not touch it: "
+              "re-save the file as ANSI/UTF-8 and run the command again.")
+        sys.exit(1)
+    return raw.decode("latin-1")  # latin-1 = lossless for any bytes
+
+
+def _backup_hosts():
+    """One copy of the very first original + a snapshot before every change (the last 5 are kept)."""
+    try:
+        if not HOSTS_BACKUP.exists():
+            shutil.copy2(HOSTS, HOSTS_BACKUP)
+        snap = HOSTS.with_name(f"{HOSTS.name}.gv-{time.strftime('%Y%m%d-%H%M%S')}.bak")
+        shutil.copy2(HOSTS, snap)
+        for old in sorted(HOSTS.parent.glob(HOSTS.name + ".gv-*.bak"))[:-5]:
+            try:
+                old.unlink()
+            except OSError:
+                pass
+    except OSError as e:
+        print("Could not make a backup of hosts:", e)
+        sys.exit(1)
+
+
+def _overwrite(data: bytes):
+    # write from the start and cut the tail afterwards: the file is never empty in the middle of the operation
+    with open(HOSTS, "r+b") as f:
+        f.seek(0)
+        f.write(data)
+        f.truncate()
 
 
 def _write_hosts(text: str):
-    if not HOSTS_BACKUP.exists():
-        shutil.copy2(HOSTS, HOSTS_BACKUP)  # one safety copy of the original
-    HOSTS.write_bytes(text.encode("latin-1"))
+    new = text.encode("latin-1")
+    old = HOSTS.read_bytes()
+    if new == old:
+        return
+    _backup_hosts()
+    err = None
+    for _ in range(3):  # an antivirus or another program may hold the file for a moment
+        try:
+            _overwrite(new)
+            if HOSTS.read_bytes() == new:
+                return
+            err = "the content read back does not match"
+        except OSError as e:
+            err = e
+        time.sleep(0.5)
+    try:
+        _overwrite(old)  # put the previous content back
+    except OSError:
+        pass
+    print(f"Could not write hosts ({err}). The previous content was restored; copies: {HOSTS_BACKUP.name}, {HOSTS.name}.gv-*.bak")
+    sys.exit(1)
 
 
 def hosts_add():
