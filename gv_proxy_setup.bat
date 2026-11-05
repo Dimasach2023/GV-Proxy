@@ -36,19 +36,13 @@ if not defined PY (
 title GV proxy setup
 cls
 echo.
-echo  1 - Install: background mode without a window + autostart at Windows logon
-echo  2 - Uninstall: stop the proxy and remove autostart
-echo  3 - Certificate and hosts + run the proxy in a window ^(test mode^)
-echo  4 - Only run the proxy in a window
-echo  5 - Remove everything ^(autostart, hosts, certificate, files^)
-echo  6 - Exit
+echo  1 - Install service
+echo  2 - Remove service
+echo  3 - Exit
 echo.
-choice /c 123456 /n /m "Choice: "
-if errorlevel 6 exit /b 0
-if errorlevel 5 goto uninstall_all
-if errorlevel 4 goto start_window
-if errorlevel 3 goto setup_window
-if errorlevel 2 goto uninstall_autostart
+choice /c 123 /n /m "Choice: "
+if errorlevel 3 exit /b 0
+if errorlevel 2 goto uninstall_all
 goto install
 
 :deps
