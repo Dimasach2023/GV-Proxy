@@ -19,3 +19,7 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+This license covers the files in this repository except the contents of the
+bin/ folder. WinDivert (bin/WinDivert.dll, bin/WinDivert64.sys) is a separate
+project by basil00, distributed under LGPLv3 / GPLv2; see bin/WinDivert-LICENSE.txt.

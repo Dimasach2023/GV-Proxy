@@ -1,4 +1,6 @@
-# Dead googlevideo nodes that should be redirected.
-# FULL addresses only, one per line (# starts a comment):
-#   rr3---sn-pivhx-n8vs.googlevideo.com
-# After changing this file, run menu item 1 (Install) again - it updates hosts.
+# Dead googlevideo nodes that should be redirected (one per line, # starts a comment):
+#   rr3---sn-pivhx-n8vs.googlevideo.com   - one exact address
+#   rr*---sn-pivhx-n8vs.googlevideo.com   - the same node on every rr1..rr30
+#   sn-pivhx-n8vs                         - short form of the line above
+# The addresses of these names are looked up in DNS and diverted by WinDivert.
+# The list is re-read every 5 minutes; to apply a change at once run menu item 1 (Install) again.
