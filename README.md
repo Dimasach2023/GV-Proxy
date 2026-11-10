@@ -1,4 +1,4 @@
-# gv_proxy
+# GV_Proxy
 
 Windows-утилита для YouTube, когда видео не грузится или постоянно буферизуется из-за **мёртвых нод googlevideo** (кеш-серверы провайдера вида `rrN---sn-xxxxx-xxxx.googlevideo.com`, которые не отвечают).
 
