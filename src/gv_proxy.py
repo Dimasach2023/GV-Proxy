@@ -566,6 +566,11 @@ FILTER_TERMS_MAX = 200      # WinDivert allows 256 filter objects in total
 DEAD_REFRESH = 300          # seconds between DNS refreshes of the dead names
 DEAD_KEEP = 3600            # an address that stopped resolving is still diverted for this long
 SYN, ACK = 0x02, 0x10
+SVC_NAME = "WinDivert"      # the driver service; "net stop WinDivert" (zapret service removal) hangs while a handle is open
+SVC_POLL = 0.5              # seconds between checks of its state
+SVC_REGRAB_DELAY = 10.0     # after the stop request is over, wait this long before taking the driver back
+ZAPRET_SVC = "zapret"       # service of zapret/winws (service.bat); its stop means that WinDivert is about to be stopped
+SVC_STOPPED, SVC_STOP_PENDING, SVC_RUNNING = 1, 3, 4
 
 
 def pack_ip(text: str):
@@ -748,6 +753,36 @@ class WinDivert:
         self.d.WinDivertClose(h)
 
 
+def service_state(name):
+    """State of a Windows service: 1 stopped, 3 stop pending, 4 running,
+    None - the service does not exist, -1 - unknown (not Windows / no access)."""
+    if os.name != "nt":
+        return -1
+    c = ctypes
+    adv = c.WinDLL("advapi32", use_last_error=True)
+    adv.OpenSCManagerW.restype = c.c_void_p
+    adv.OpenSCManagerW.argtypes = [c.c_wchar_p, c.c_wchar_p, c.c_uint32]
+    adv.OpenServiceW.restype = c.c_void_p
+    adv.OpenServiceW.argtypes = [c.c_void_p, c.c_wchar_p, c.c_uint32]
+    adv.QueryServiceStatus.argtypes = [c.c_void_p, c.c_void_p]
+    adv.QueryServiceStatus.restype = c.c_int
+    adv.CloseServiceHandle.argtypes = [c.c_void_p]
+    scm = adv.OpenSCManagerW(None, None, 1)             # SC_MANAGER_CONNECT
+    if not scm:
+        return -1
+    try:
+        svc = adv.OpenServiceW(scm, name, 4)             # SERVICE_QUERY_STATUS
+        if not svc:
+            return None if c.get_last_error() == 1060 else -1   # ERROR_SERVICE_DOES_NOT_EXIST
+        try:
+            status = (c.c_uint32 * 7)()                 # SERVICE_STATUS: 7 DWORDs, the 2nd is the state
+            return status[1] if adv.QueryServiceStatus(svc, status) else -1
+        finally:
+            adv.CloseServiceHandle(svc)
+    finally:
+        adv.CloseServiceHandle(scm)
+
+
 # ----------------------------------------------------------------- dead addresses + filter
 def resolve_dead_ips(names, workers=16, timeout=25):
     """{packed ip: set(names)} for all names (IPv4 and IPv6) through the system resolver."""
@@ -819,6 +854,8 @@ class Engine:
         self.stop_ev = threading.Event()
         self.lock = threading.Lock()
         self.ok = False
+        self.released = False      # we let go of the driver because somebody is stopping it
+        self.released_at = 0.0
 
     def is_dead(self, ip_text: str) -> bool:
         b = pack_ip(ip_text)
@@ -831,6 +868,7 @@ class Engine:
             log(f"[divert] ERROR: {e}")
             return False
         threading.Thread(target=self._resolver, daemon=True, name="gv-resolver").start()
+        threading.Thread(target=self._watch, daemon=True, name="gv-watch").start()
         return True
 
     def stop(self):
@@ -865,19 +903,69 @@ class Engine:
                 log(f"[divert] ERROR in the resolver: {e!r}")
             self.stop_ev.wait(DEAD_REFRESH if self.dead else 30)
 
-    def _reopen(self):
+    def _release(self):
+        with self.lock:
+            self.released = True
+            self.released_at = time.monotonic()
+            old, self.cur = self.cur, None
+        if old:
+            try:
+                self.wd.close(old[0])
+            except Exception:
+                pass
+
+    def _watch(self):
+        """zapret's "Remove Services" stops the zapret service and then runs "net stop WinDivert". The driver
+        cannot unload while we hold a handle, so that command hangs or prints errors. So we let go of the
+        handle as soon as the zapret service stops (or somebody asks the driver to stop) - the driver then
+        unloads by itself - and take it back several seconds later."""
+        warned = 0.0
+        zap_prev = None
+        while not self.stop_ev.wait(SVC_POLL):
+            try:
+                st = service_state(SVC_NAME)
+                zap = service_state(ZAPRET_SVC)
+                zap_stopping = zap_prev == SVC_RUNNING and zap in (SVC_STOPPED, SVC_STOP_PENDING, None)
+                zap_prev = zap
+                busy = st == SVC_STOP_PENDING or zap == SVC_STOP_PENDING
+                if not self.released:
+                    if self.cur and (st == SVC_STOP_PENDING or zap_stopping):
+                        log("[divert] zapret service / WinDivert is being stopped: releasing the driver, "
+                            "will reconnect in a few seconds")
+                        self._release()
+                elif busy:
+                    self.released_at = time.monotonic()
+                elif time.monotonic() - self.released_at >= SVC_REGRAB_DELAY:
+                    with self.lock:
+                        self.released = False
+                    if self._reopen(quiet=True):
+                        log("[divert] reconnected to WinDivert")
+                    elif self.dead:
+                        with self.lock:
+                            self.released = True          # not possible yet (the old service is still going away)
+                            self.released_at = time.monotonic() - SVC_REGRAB_DELAY + 1
+                        if time.monotonic() - warned > 30:
+                            warned = time.monotonic()
+                            log("[divert] waiting to reconnect to WinDivert...")
+            except Exception as e:  # noqa
+                log(f"[divert] ERROR in the watcher: {e!r}")
+
+    def _reopen(self, quiet=False) -> bool:
         flt = build_filter(self.port, self.dead, self.drop_quic)
         with self.lock:
+            if self.released:
+                return False
             if self.stop_ev.is_set() or (self.cur and self.cur[1] == flt) or (not self.cur and flt is None):
-                return
+                return True
             old, new = self.cur, None
             if flt is not None:
                 self.prio += 1
                 try:
                     h = self.wd.open(flt, self.prio)
                 except OSError as e:
-                    log(f"[divert] ERROR: {e}")
-                    return
+                    if not quiet:
+                        log(f"[divert] ERROR: {e}")
+                    return False
                 new = (h, flt)
                 threading.Thread(target=self._loop, args=(h,), daemon=True, name="gv-divert").start()
                 log(f"[divert] active, {len(self.dead)} addresses")
@@ -888,6 +976,7 @@ class Engine:
                     self.wd.close(old[0])   # its loop ends by itself
                 except Exception:
                     pass
+        return True
 
     def _loop(self, h):
         buf = ctypes.create_string_buffer(65600)
