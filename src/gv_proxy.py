@@ -1292,7 +1292,7 @@ class Proxy:
         n = st["requests"]
         if not n:
             return ""
-        return (f"stats: {n} requests, {st['reused']} on a kept-alive/pooled connection, "
+        return (f"stats: {n} requests (+{st.get('local_204', 0)} generate_204 answered locally), {st['reused']} on a kept-alive/pooled connection, "
                 f"route cache hits {st['route_hit']}, stale routes {st['route_stale']}, full searches {st['cold']}, "
                 f"average time to the response head {(self.ttfb or 0):.2f}s, "
                 f"hedge delay {self.hedge_delay():.2f}s, routes {len(self.routes)}")
@@ -1705,6 +1705,17 @@ class Proxy:
             await writer.drain()
         return False
 
+    @staticmethod
+    async def answer_204(writer, headers):
+        """The answer to /generate_204 is an empty 204; YouTube also needs the CORS headers (it fetches it from
+        www.youtube.com), so the Origin of the request is echoed back."""
+        origin = headers.get("origin", "")
+        cors = (f"Access-Control-Allow-Origin: {origin}\r\nAccess-Control-Allow-Credentials: true\r\n"
+                f"Timing-Allow-Origin: {origin}\r\nVary: Origin\r\n") if origin and "\r" not in origin and "\n" not in origin else ""
+        writer.write(("HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n" + cors +
+                      "Cache-Control: no-cache, no-store, must-revalidate\r\nConnection: keep-alive\r\n\r\n").encode())
+        await writer.drain()
+
     async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         cur = None  # idle upstream connection kept for the next request: (reader, writer, up_host)
         _tune(writer)
@@ -1732,6 +1743,12 @@ class Proxy:
                 elif length:
                     body = await asyncio.wait_for(reader.readexactly(length), IDLE_TIMEOUT)
 
+                probe = urlsplit(target).path == "/generate_204" and method in ("GET", "HEAD")
+                if probe and not getattr(self.args, "real_204", False):
+                    # a connectivity probe to a dead node: answer at once, no round trip to a far node
+                    self.stats["local_204"] = self.stats.get("local_204", 0) + 1
+                    await self.answer_204(writer, headers)
+                    continue
                 candidates = self.pick_upstreams(host, target)
                 if not candidates:
                     mn = parse_qs(urlsplit(target).query).get("mn", [""])[0]
@@ -1747,17 +1764,12 @@ class Proxy:
                     reuse = self.take_pooled(grp)  # (small probes like generate_204 always use a fresh connection)
 
                 res = await self.exchange(head, candidates, body, stream, reuse, host)
-                if res is None and urlsplit(target).path == "/generate_204" and method in ("GET", "HEAD"):
+                if res is None and probe:
                     # Connectivity probe: its answer is an empty 204 anyway. If no node could be reached for it, answer
                     # it here instead of dropping the connection (ERR_EMPTY_RESPONSE) - the real requests that follow
                     # (/videoplayback) are still sent to working nodes.
                     log(f"{host}: no node reachable for /generate_204 -> answered 204 locally")
-                    origin = headers.get("origin", "")
-                    cors = (f"Access-Control-Allow-Origin: {origin}\r\nAccess-Control-Allow-Credentials: true\r\n"
-                            f"Timing-Allow-Origin: {origin}\r\nVary: Origin\r\n") if origin and "\r" not in origin and "\n" not in origin else ""
-                    writer.write(("HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n" + cors +
-                                  "Cache-Control: no-cache, no-store, must-revalidate\r\nConnection: keep-alive\r\n\r\n").encode())
-                    await writer.drain()
+                    await self.answer_204(writer, headers)
                     continue
                 if res is None:
                     log(f"no upstream for {host}: every candidate failed (the browser will retry)")
@@ -1854,6 +1866,8 @@ def main():
     ap.add_argument("--upstream-port", type=int, default=443)
     ap.add_argument("--fallback-video", action="store_true",
                     help="also send /videoplayback to --fallback-host when mn= gives no working node (it normally answers 400)")
+    ap.add_argument("--real-204", action="store_true",
+                    help="send /generate_204 to a real node instead of answering it locally (slower)")
     ap.add_argument("--insecure-upstream", action="store_true", help="do not verify the upstream certificate (tests only)")
     ap.add_argument("--log", action="store_true", help="write the log to gv_proxy.log (enabled automatically without a console)")
     args = ap.parse_args()
