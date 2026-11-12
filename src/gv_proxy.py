@@ -31,6 +31,7 @@ import datetime
 import hashlib
 import ipaddress
 import itertools
+import json
 import os
 import re
 import socket
@@ -67,6 +68,7 @@ DEFAULT_BLOCKED = """# Dead googlevideo nodes that should be redirected.
 
 RR_MAX = 30   # rr* in blocked.txt expands to rr1 .. rr30
 LOG_FILE = DATA / "gv_proxy.log"
+ROUTES_FILE = DATA / "route_cache.json"   # the route cache survives a restart (entries live ROUTE_TTL anyway)
 TASK_NAME = "GV Proxy"
 FW_RULE = "GV Proxy local port"
 DEFAULT_PORT = 18443      # local port of the proxy (WinDivert redirects to it, so it is not 443 any more)
@@ -82,6 +84,21 @@ ALT_PER_NODE = 3            # how many of them are tried besides the rr of the o
 UP_MAX_IPS = 2              # how many IPs of one node to try before moving to the next node
 DNS_TTL = 300               # seconds a resolved node name is cached
 BAD_TTL = 120               # seconds a failed (node, ip) is deprioritised
+ROUTE_TTL = 1800            # seconds a found route is remembered (node -> the name/IP that connected, and
+                            # request host -> the node that worked); after that it is forgotten, not permanent
+ROUTE_FAST_TIMEOUT = 2.5    # a remembered route gets this long; if it does not connect the full search runs
+PAR_NODES = 2               # how many nodes from mn= are asked at the same time for a replayable request
+PAR_DELAY = 0.3             # the 2nd node is started this long after the 1st (at once if the 1st already failed)
+HEDGE_MIN = 0.35            # lower bound of the adaptive hedge delay
+POOL_MAX_AGE = 25           # seconds an idle upstream connection waits in the shared pool (nodes drop idle ones)
+POOL_PER_HOST = 4           # idle connections kept per node name
+POOL_TOTAL = 16             # ... and in total
+ROUTE_REFRESH_BEFORE = 300  # a route that expires within this many seconds is re-checked in the background ...
+ROUTE_REFRESH_WINDOW = 3600  # ... but only if it served a real request within this many seconds (never forever)
+STATS_EVERY = 300           # seconds between the statistics lines in the log
+SPEED_DEFAULT = 0.6         # assumed response time (s) of a node that has no measurement yet
+ROUTE_SAVE_EVERY = 30       # seconds between saves of the route cache (only when it changed)
+ROUTE_MAX = 512             # size limit of the route caches
 IDLE_TIMEOUT = 120          # seconds of silence after which an idle connection is dropped
 DEFAULT_LISTEN = ["0.0.0.0", "::"]   # redirected packets arrive on our own address, not on loopback
 RESP_HEAD_TIMEOUT = 15      # seconds to wait for the response head of a node
@@ -1043,6 +1060,15 @@ class Proxy:
         self.engine = engine  # knows the dead addresses (None = no WinDivert, e.g. tests)
         self.dns_cache = {}   # host -> (expires_at, [ips])
         self.bad = {}         # (host, ip) -> time until which it is deprioritised
+        self.pool = {}        # up_host -> [(idle_since, reader, writer)]: idle upstream connections shared by all clients
+        self.used_at = {}     # candidate node -> monotonic time of its last real request
+        self.speeds = {}      # candidate node -> (expires_at, smoothed seconds to the response head)
+        self.stats = {"requests": 0, "reused": 0, "route_hit": 0, "cold": 0, "route_stale": 0}
+        self.ttfb = None
+        self._routes_saved_at = 0.0
+        self.rtt = None       # smoothed duration of a successful connect+TLS (s): sets the hedge delay
+        self.routes = {}      # candidate node -> (expires_at, up_host, ip): the route that connected last
+        self.chosen = {}      # request host -> (expires_at, candidate node): the node that answered last
         self._file_cache = {}
         self.up_ctx = ssl.create_default_context()
         self.up_ctx.minimum_version = ssl.TLSVersion.TLSv1_2
@@ -1102,6 +1128,197 @@ class Proxy:
         alts = [f"rr{k}---{node}.googlevideo.com" for k in ALT_RR_POOL if str(k) != m.group(1)]
         return [name] + [a for a in alts if a not in dead_hosts][:ALT_PER_NODE]
 
+    # ------------------------------------------------------------ time-limited route memory
+    def _mem_get(self, store: dict, key):
+        hit = store.get(key)
+        if hit is None:
+            return None
+        if hit[0] <= time.monotonic():
+            store.pop(key, None)
+            return None
+        return hit[1:]
+
+    def _mem_put(self, store: dict, key, *value):
+        if len(store) >= ROUTE_MAX:
+            now = time.monotonic()
+            for k in [k for k, v in store.items() if v[0] <= now]:
+                del store[k]
+            while len(store) >= ROUTE_MAX:
+                store.pop(next(iter(store)))
+        store[key] = (time.monotonic() + ROUTE_TTL, *value)
+
+    def save_routes(self, force: bool = False):
+        """Writes the route cache to ROUTES_FILE (wall-clock expiry times, since monotonic does not survive a restart).
+        Does nothing if nothing changed since the last save."""
+        now_m, now_w = time.monotonic(), time.time()
+        snap = {
+            "routes": {k: [round(now_w + v[0] - now_m), v[1], v[2]] for k, v in list(self.routes.items()) if v[0] > now_m},
+            "chosen": {k: [round(now_w + v[0] - now_m), v[1]] for k, v in list(self.chosen.items()) if v[0] > now_m},
+        }
+        # the expiry moves only with real activity; compare without it so an idle cache is not rewritten
+        sig = json.dumps({a: {k: v[1:] for k, v in d.items()} for a, d in snap.items()}, sort_keys=True)
+        if sig == getattr(self, "_routes_sig", None) and not force and now_m - self._routes_saved_at < 300:
+            return
+        try:
+            DATA.mkdir(parents=True, exist_ok=True)
+            tmp = ROUTES_FILE.with_suffix(".tmp")
+            tmp.write_text(json.dumps(snap), encoding="utf-8")
+            os.replace(tmp, ROUTES_FILE)
+            self._routes_sig = sig
+            self._routes_saved_at = now_m
+        except OSError as e:
+            log(f"could not save the route cache: {e!r}")
+
+    def load_routes(self):
+        """Loads the saved routes; expired or malformed entries are skipped. A broken file is ignored."""
+        try:
+            data = json.loads(ROUTES_FILE.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        now_m, now_w = time.monotonic(), time.time()
+        n = 0
+        try:
+            for k, (exp, host, ip) in data.get("routes", {}).items():
+                if exp > now_w and isinstance(k, str) and isinstance(host, str):
+                    ipaddress.ip_address(ip)
+                    self.routes[k] = (now_m + min(exp - now_w, ROUTE_TTL), host, ip)
+                    n += 1
+            for k, (exp, cand) in data.get("chosen", {}).items():
+                if exp > now_w and isinstance(k, str) and isinstance(cand, str):
+                    self.chosen[k] = (now_m + min(exp - now_w, ROUTE_TTL), cand)
+        except (ValueError, TypeError, AttributeError):
+            self.routes.clear()
+            self.chosen.clear()
+            return
+        if n:
+            log(f"route cache: {n} saved routes restored")
+
+    # ------------------------------------------------------------ shared pool of idle upstream connections
+    def put_pooled(self, up_host: str, ur, uw):
+        """Keeps a clean idle upstream connection for the next client connection (they open several in parallel and
+        a new one would pay for TCP + TLS to a possibly far node again)."""
+        if uw.is_closing() or ur.at_eof():
+            self._close(uw)
+            return
+        lst = self.pool.setdefault(up_host, [])
+        lst.append((time.monotonic(), ur, uw))
+        while len(lst) > POOL_PER_HOST:
+            self._close(lst.pop(0)[2])
+        while sum(len(v) for v in self.pool.values()) > POOL_TOTAL:
+            oldest = min((v[0][0], k) for k, v in self.pool.items() if v)[1]
+            self._close(self.pool[oldest].pop(0)[2])
+
+    def take_pooled(self, names: list):
+        now = time.monotonic()
+        for n in names:
+            lst = self.pool.get(n)
+            while lst:
+                t, ur, uw = lst.pop()  # the most recently used one is the least likely to be stale
+                if now - t < POOL_MAX_AGE and not uw.is_closing() and not ur.at_eof():
+                    return ur, uw, n
+                self._close(uw)
+        return None
+
+    def _pool_sweep(self):
+        now = time.monotonic()
+        for k in list(self.pool):
+            keep = []
+            for item in self.pool[k]:
+                if now - item[0] < POOL_MAX_AGE and not item[2].is_closing() and not item[1].at_eof():
+                    keep.append(item)
+                else:
+                    self._close(item[2])
+            if keep:
+                self.pool[k] = keep
+            else:
+                del self.pool[k]
+
+    # ------------------------------------------------------------ speed of the nodes
+    def _note_speed(self, cand: str, dt: float):
+        old = self._mem_get(self.speeds, cand)
+        self._mem_put(self.speeds, cand, dt if old is None else old[0] * 0.6 + dt * 0.4)
+
+    def order_candidates(self, host: str, candidates: list) -> list:
+        """Fastest known node first (a node without a measurement counts as the median one, so it still gets its
+        turn); the node that answered this host last gets a small bonus. The fallback host always stays last."""
+        fb = self.args.fallback_host
+        nodes = [c for c in candidates if c != fb]
+        tail = [c for c in candidates if c == fb]
+        if len(nodes) > 1:
+            known = sorted(v[0] for v in (self._mem_get(self.speeds, c) for c in nodes) if v)
+            default = known[len(known) // 2] if known else SPEED_DEFAULT
+            hit = self._mem_get(self.chosen, host)
+            chosen = hit[0] if hit else None
+
+            def key(c):
+                v = self._mem_get(self.speeds, c)
+                v = v[0] if v else default
+                return v * 0.7 if c == chosen else v
+            nodes.sort(key=key)
+        return nodes + tail
+
+    # ------------------------------------------------------------ background upkeep
+    async def _refresh_routes(self):
+        """Re-checks routes that are about to expire (only those that served a request lately), so the first request
+        after a pause does not start a cold search. A route that no longer works is replaced by a fresh search."""
+        now = time.monotonic()
+        todo = [(c, v) for c, v in list(self.routes.items())
+                if v[0] - now < ROUTE_REFRESH_BEFORE and now - self.used_at.get(c, -1e9) < ROUTE_REFRESH_WINDOW][:4]
+        for cand, (_exp, name, ip) in todo:
+            try:
+                ur, uw, up_host, ip2 = await asyncio.wait_for(self._race_connect([(name, ip)]), ROUTE_FAST_TIMEOUT)
+                self._close(uw)
+                self._mem_put(self.routes, cand, up_host, ip2)
+                for k, v in list(self.chosen.items()):
+                    if v[1] == cand:
+                        self._mem_put(self.chosen, k, cand)
+            except (OSError, ssl.SSLError, asyncio.TimeoutError):
+                self.routes.pop(cand, None)
+                try:
+                    conn = await self.connect_upstream([cand], set())  # stores the new route by itself
+                    if conn:
+                        self._close(conn[1])
+                except Exception:  # noqa
+                    pass
+
+    def stats_line(self) -> str:
+        st = self.stats
+        n = st["requests"]
+        if not n:
+            return ""
+        return (f"stats: {n} requests, {st['reused']} on a kept-alive/pooled connection, "
+                f"route cache hits {st['route_hit']}, stale routes {st['route_stale']}, full searches {st['cold']}, "
+                f"average time to the response head {(self.ttfb or 0):.2f}s, "
+                f"hedge delay {self.hedge_delay():.2f}s, routes {len(self.routes)}")
+
+    async def _maint_loop(self):
+        t_save = t_refresh = t_stats = time.monotonic()
+        while True:
+            await asyncio.sleep(10)
+            now = time.monotonic()
+            try:
+                self._pool_sweep()
+                if len(self.used_at) > ROUTE_MAX:
+                    self.used_at.clear()
+                if now - t_save >= ROUTE_SAVE_EVERY:
+                    t_save = now
+                    self.save_routes()
+                if now - t_refresh >= 120:
+                    t_refresh = now
+                    await self._refresh_routes()
+                if now - t_stats >= STATS_EVERY:
+                    t_stats = now
+                    line = self.stats_line()
+                    if line:
+                        log(line)
+            except Exception as e:  # noqa - upkeep must never die
+                log(f"upkeep error: {e!r}")
+
+    def forget_route(self, cand: str):
+        self.routes.pop(cand, None)
+        for k in [k for k, v in self.chosen.items() if v[1] == cand]:
+            del self.chosen[k]
+
     @staticmethod
     def _is_loopback(ip: str) -> bool:
         return ip.startswith("127.")
@@ -1125,6 +1342,16 @@ class Proxy:
         self.dns_cache[host] = (time.monotonic() + DNS_TTL, ips)
         return ips
 
+    def hedge_delay(self) -> float:
+        """Pause before the next staggered attempt: ~1.5x the usual connect time, so that on a fast path a lost SYN
+        is covered quickly and on a far one (Netherlands, 300+ ms) a slow-but-alive attempt is not duplicated."""
+        if self.rtt is None:
+            return HEDGE_DELAY
+        return min(HEDGE_DELAY, max(HEDGE_MIN, self.rtt * 1.5))
+
+    def _note_rtt(self, dt: float):
+        self.rtt = dt if self.rtt is None else self.rtt * 0.7 + dt * 0.3
+
     async def _race_connect(self, plan):
         """Hedged connect over a plan of (name, ip) pairs: a new attempt is started every HEDGE_DELAY seconds
         (or at once if the previous one failed) and the first connection that completes the TLS handshake
@@ -1145,7 +1372,7 @@ class Proxy:
                 left = deadline - time.monotonic()
                 if not pending or left <= 0:
                     break
-                wait = min(HEDGE_DELAY, left) if nxt < len(plan) else left
+                wait = min(self.hedge_delay(), left) if nxt < len(plan) else left
                 done, _ = await asyncio.wait(list(pending), timeout=wait, return_when=asyncio.FIRST_COMPLETED)
                 for t in done:
                     name, ip = pending.pop(t)
@@ -1156,13 +1383,16 @@ class Proxy:
                         continue
                     if winner is None:
                         winner = (conn[0], conn[1], name, ip)
+                        dt = time.monotonic() - started[t]
+                        if dt < 3:
+                            self._note_rtt(dt)
                     else:
                         self._close(conn[1])  # two attempts finished together: keep one
         finally:
             now = time.monotonic()
             for t, pair in pending.items():
                 t.cancel()
-                if winner is not None and now - started[t] >= HEDGE_DELAY * 0.9:
+                if winner is not None and now - started[t] >= self.hedge_delay() * 0.9:
                     self.bad[pair] = now + BAD_TTL  # slower than the winner: try it last next time
             for r in await asyncio.gather(*pending, return_exceptions=True):
                 if isinstance(r, tuple):
@@ -1183,8 +1413,35 @@ class Proxy:
         Every candidate it actually tries is added to `tried`. A node whose addresses all failed recently is
         skipped while there are other options (and not counted as tried); as the last option it is tried."""
         now = time.monotonic()
+        if (not self.args.upstream_ip and len(candidates) > 1
+                and self._mem_get(self.routes, candidates[0]) is None):
+            # cold start: resolve the names of the LATER candidates in the background while the first one connects,
+            # so if it fails the next candidate does not wait for DNS
+            later = [n for c in candidates[1:] for n in self.group(c) if n not in self.dns_cache]
+            for n in dict.fromkeys(later):
+                asyncio.ensure_future(self._resolve_quiet(n))
         for idx, cand in enumerate(candidates):
             last = idx == len(candidates) - 1
+            route = None if self.args.upstream_ip else self._mem_get(self.routes, cand)
+            if route:
+                r_name, r_ip = route
+                if self._is_loopback(r_ip) or self._is_dead_ip(r_ip):
+                    self.routes.pop(cand, None)
+                else:
+                    # a route that worked recently: no DNS, no search over the other names, just connect
+                    try:
+                        ur, uw, up_host, ip = await asyncio.wait_for(
+                            self._race_connect([(r_name, r_ip)]), ROUTE_FAST_TIMEOUT)
+                    except (OSError, ssl.SSLError, asyncio.TimeoutError):
+                        self.routes.pop(cand, None)
+                        self.stats["route_stale"] += 1
+                        self.bad[(r_name, r_ip)] = time.monotonic() + BAD_TTL
+                        log(f"remembered route {r_name} [{r_ip}] did not connect -> searching again")
+                    else:
+                        self.stats["route_hit"] += 1
+                        tried.add(cand)
+                        _tune(uw)
+                        return ur, uw, up_host, ip
             names = self.group(cand)
             resolved = await asyncio.gather(*(self._resolve_quiet(n) for n in names))
             ipmap = {}
@@ -1215,12 +1472,16 @@ class Proxy:
             except (OSError, ssl.SSLError, asyncio.TimeoutError) as e:
                 for p in plan:
                     self.bad[p] = time.monotonic() + BAD_TTL
+                self.routes.pop(cand, None)
                 for n in names:
                     self.dns_cache.pop(n, None)  # maybe the address changed - resolve again next time
                 shown = ", ".join("%s[%s]" % (n.split(".")[0], p_ip) for n, p_ip in plan)
                 log(f"UPSTREAM ERROR {cand}: {e!r} (tried {shown})")
                 continue
             self.bad.pop((up_host, ip), None)
+            self.stats["cold"] += 1
+            if not self.args.upstream_ip:
+                self._mem_put(self.routes, cand, up_host, ip)
             if time.monotonic() - t_conn > 1.0 or up_host != cand:
                 log(f"connect to {cand}: {time.monotonic() - t_conn:.1f}s, connected via {up_host} [{ip}]")
             _tune(uw)
@@ -1236,7 +1497,86 @@ class Proxy:
         except (asyncio.IncompleteReadError, asyncio.LimitOverrunError, asyncio.TimeoutError, OSError):
             return None
 
-    async def exchange(self, head, candidates, body, stream, reuse):
+    async def _try_node(self, head, cand, body):
+        """Connect to one candidate node, send the request, read the response head.
+        Returns (resp, ur, uw, up_host) or None. Safe to cancel (closes what it opened)."""
+        uw = None
+        t0 = time.monotonic()
+        try:
+            conn = await self.connect_upstream([cand], set())
+            if conn is None:
+                return None
+            ur, uw, up_host, _ip = conn
+            try:
+                uw.write(rewrite_host(head, up_host))
+                if body:
+                    uw.write(body)
+                await uw.drain()
+            except (OSError, asyncio.TimeoutError):
+                resp = None
+            else:
+                resp = await self.read_resp_head(ur)
+            if resp is None:
+                log(f"no answer from {up_host}")
+                self.routes.pop(cand, None)
+                self._close(uw)
+                return None
+            res, uw = (resp, ur, uw, up_host, time.monotonic() - t0), None
+            return res
+        finally:
+            if uw is not None:  # cancelled or failed half way
+                self._close(uw)
+
+    async def _race_nodes(self, head, cands, body):
+        """Asks the first PAR_NODES candidates at (almost) the same time; the first node that gives a good answer
+        wins and the others are dropped. Returns (winner, bad, tried): winner = (resp, ur, uw, up_host, cand),
+        bad = the last 400/403/5xx answer in the same shape (or None)."""
+        order = list(cands[:PAR_NODES])
+        pending, who, nxt = set(), {}, 0
+        winner = bad = None
+        try:
+            while winner is None:
+                if nxt < len(order):
+                    t = asyncio.ensure_future(self._try_node(head, order[nxt], body))
+                    pending.add(t)
+                    who[t] = order[nxt]
+                    nxt += 1
+                if not pending:
+                    break
+                done, _ = await asyncio.wait(pending, timeout=PAR_DELAY if nxt < len(order) else None,
+                                             return_when=asyncio.FIRST_COMPLETED)
+                for t in done:
+                    pending.discard(t)
+                    try:
+                        r = t.result()
+                    except Exception:  # noqa
+                        r = None
+                    if r is None:
+                        continue
+                    r = r[:4] + (who[t], r[4])  # (resp, ur, uw, up_host, cand, seconds)
+                    status = parse_status(r[0])
+                    if status in RETRY_STATUS or status >= 500:
+                        log(f"{r[3]} answered {status} -> trying another node")
+                        self.forget_route(who[t])
+                        if bad:
+                            self._close(bad[2])
+                        bad = r
+                    elif winner is None:
+                        winner = r
+                    else:
+                        self._close(r[2])
+        finally:
+            for t in pending:
+                t.cancel()
+            for r in await asyncio.gather(*pending, return_exceptions=True):
+                if isinstance(r, tuple):  # finished just before the cancel: do not leak it
+                    self._close(r[2])
+        if winner is not None and bad is not None:
+            self._close(bad[2])
+            bad = None
+        return winner, bad, set(order[:nxt])
+
+    async def exchange(self, head, candidates, body, stream, reuse, host=""):
         """Sends one request and returns (resp_head, ur, uw, up_host) or None.
         - the node is chosen per request (from ITS mn=), not once per connection;
         - a node that answers 400/403/5xx, or does not answer at all, is replaced by the next candidate
@@ -1247,6 +1587,25 @@ class Proxy:
         tried, best, use = set(), None, reuse
         while True:
             fresh = use is None
+            t_try = time.monotonic()
+            if fresh and replayable and PAR_NODES > 1:
+                remaining = [c for c in candidates if c not in tried]
+                if len(remaining) >= 2:
+                    win, bad, now_tried = await self._race_nodes(head, remaining, body)
+                    tried |= now_tried
+                    if win is not None:
+                        if best:
+                            self._close(best[2])
+                        if parse_status(win[0]) < 400:
+                            self._mem_put(self.chosen, host, win[4])
+                        self._note_speed(win[4], win[5])
+                        self.used_at[win[4]] = time.monotonic()
+                        return win[:4]
+                    if bad is not None:
+                        if best:
+                            self._close(best[2])
+                        best = bad[:4]
+                    continue
             if fresh:
                 remaining = [c for c in candidates if c not in tried]
                 conn = await self.connect_upstream(remaining, tried) if remaining else None
@@ -1270,14 +1629,20 @@ class Proxy:
                 resp = await self.read_resp_head(ur)
             if resp is None:
                 log(f"no answer from {up_host}" + ("" if fresh else " (stale keep-alive, reconnecting)"))
+                if fresh:  # a stale keep-alive proves nothing about the route; a fresh connection that is silent does
+                    for c in candidates:
+                        if up_host in self.group(c):
+                            self.routes.pop(c, None)
                 self._close(uw)
                 if not replayable:
                     break
                 continue
             # it has answered: a retry must go to a different node
-            tried.add(next((c for c in candidates if up_host in self.group(c)), up_host))
+            cand_used = next((c for c in candidates if up_host in self.group(c)), up_host)
+            tried.add(cand_used)
             status = parse_status(resp)
             if status in RETRY_STATUS or status >= 500:
+                self.forget_route(cand_used)
                 if replayable and any(c not in tried for c in candidates):
                     log(f"{up_host} answered {status} -> trying another node")
                     if best:
@@ -1286,6 +1651,11 @@ class Proxy:
                     continue
             if best:
                 self._close(best[2])
+            if status < 400 and cand_used in candidates:
+                self._mem_put(self.chosen, host, cand_used)
+                self.used_at[cand_used] = time.monotonic()
+                if fresh:
+                    self._note_speed(cand_used, time.monotonic() - t_try)
             return resp, ur, uw, up_host
         return best
 
@@ -1354,16 +1724,25 @@ class Proxy:
                     mn = parse_qs(urlsplit(target).query).get("mn", [""])[0]
                     log(f"{host}: no usable node in mn={mn!r} for {target[:40]} -> closing, the player will switch host itself")
                     break
-                reuse = cur if (cur and stream is None and cur[2] in self.group(candidates[0])) else None
+                candidates = self.order_candidates(host, candidates)
+                grp = self.group(candidates[0])
+                reuse = cur if (cur and stream is None and cur[2] in grp) else None
                 if cur and reuse is None:
-                    self._close(cur[1])
+                    self.put_pooled(cur[2], cur[0], cur[1])  # still clean: another client connection can use it
                 cur = None
+                if reuse is None and stream is None:
+                    reuse = self.take_pooled(grp)
 
-                res = await self.exchange(head, candidates, body, stream, reuse)
+                res = await self.exchange(head, candidates, body, stream, reuse, host)
                 if res is None:
                     log(f"no upstream for {host}: every candidate failed (the browser will retry)")
                     break
                 resp, ur, uw, up_host = res
+                dt_req = time.monotonic() - t_req
+                self.stats["requests"] += 1
+                if reuse is not None and ur is reuse[0]:
+                    self.stats["reused"] += 1
+                self.ttfb = dt_req if self.ttfb is None else self.ttfb * 0.9 + dt_req * 0.1
                 q = parse_qs(urlsplit(target).query)
                 log(f"{host} -> {up_host} {method} {urlsplit(target).path} mn={q.get('mn', [''])[0]} "
                     f"=> {parse_status(resp)} {time.monotonic() - t_req:.2f}s"
@@ -1378,7 +1757,7 @@ class Proxy:
             log(f"connection error: {e!r}")
         finally:
             if cur:
-                self._close(cur[1])
+                self.put_pooled(cur[2], cur[0], cur[1])
             self._close(writer)
 
 
@@ -1410,6 +1789,9 @@ async def run(args):
             pass
     sctx.sni_callback = _hello
     proxy = Proxy(args, engine)
+    if not args.upstream_ip:
+        proxy.load_routes()
+        save_task = asyncio.ensure_future(proxy._maint_loop())
     servers = []
     for addr in (args.listen or DEFAULT_LISTEN):
         try:
@@ -1426,6 +1808,9 @@ async def run(args):
     try:
         await asyncio.gather(*(s.serve_forever() for s in servers))
     finally:
+        if not args.upstream_ip:
+            save_task.cancel()
+            proxy.save_routes(force=True)
         if engine:
             engine.stop()
     return 0
