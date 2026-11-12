@@ -90,7 +90,8 @@ ROUTE_FAST_TIMEOUT = 2.5    # a remembered route gets this long; if it does not 
 PAR_NODES = 2               # how many nodes from mn= are asked at the same time for a replayable request
 PAR_DELAY = 0.3             # the 2nd node is started this long after the 1st (at once if the 1st already failed)
 HEDGE_MIN = 0.35            # lower bound of the adaptive hedge delay
-POOL_MAX_AGE = 25           # seconds an idle upstream connection waits in the shared pool (nodes drop idle ones)
+POOL_MAX_AGE = 10           # seconds an idle upstream connection waits in the shared pool (nodes drop idle ones)
+STALE_HEAD_TIMEOUT = 3       # a REUSED connection that stays silent this long is treated as dead and replaced
 POOL_PER_HOST = 4           # idle connections kept per node name
 POOL_TOTAL = 16             # ... and in total
 ROUTE_REFRESH_BEFORE = 300  # a route that expires within this many seconds is re-checked in the background ...
@@ -1114,6 +1115,10 @@ class Proxy:
         # videoplayback there is no fallback: the connection is closed and the player switches host itself.
         if urlsplit(target).path != "/videoplayback" or self.args.fallback_video:
             out.append(self.args.fallback_host)
+            if urlsplit(target).path != "/videoplayback":
+                # any node answers /generate_204 and the like: besides the fallback host also try nodes that worked
+                # lately (the fallback may be unreachable from this network)
+                out += [c for c in reversed(list(self.routes)) if c != self.args.fallback_host][:2]
         return list(dict.fromkeys(out))
 
     def group(self, name: str) -> list:
@@ -1179,7 +1184,7 @@ class Proxy:
         n = 0
         try:
             for k, (exp, host, ip) in data.get("routes", {}).items():
-                if exp > now_w and isinstance(k, str) and isinstance(host, str):
+                if exp > now_w and isinstance(k, str) and isinstance(host, str) and k != self.args.fallback_host:
                     ipaddress.ip_address(ip)
                     self.routes[k] = (now_m + min(exp - now_w, ROUTE_TTL), host, ip)
                     n += 1
@@ -1197,7 +1202,8 @@ class Proxy:
     def put_pooled(self, up_host: str, ur, uw):
         """Keeps a clean idle upstream connection for the next client connection (they open several in parallel and
         a new one would pay for TCP + TLS to a possibly far node again)."""
-        if uw.is_closing() or ur.at_eof():
+        if uw.is_closing() or ur.at_eof() or up_host == self.args.fallback_host:
+            # (the fallback node serves tiny generate_204-like requests: nothing to gain from keeping it)
             self._close(uw)
             return
         lst = self.pool.setdefault(up_host, [])
@@ -1349,6 +1355,12 @@ class Proxy:
             return HEDGE_DELAY
         return min(HEDGE_DELAY, max(HEDGE_MIN, self.rtt * 1.5))
 
+    def fast_timeout(self) -> float:
+        """How long a remembered route gets before the full search starts: ~3x the usual connect time (0.8 .. 2.5 s)."""
+        if self.rtt is None:
+            return ROUTE_FAST_TIMEOUT
+        return min(ROUTE_FAST_TIMEOUT, max(0.8, self.rtt * 3))
+
     def _note_rtt(self, dt: float):
         self.rtt = dt if self.rtt is None else self.rtt * 0.7 + dt * 0.3
 
@@ -1422,7 +1434,8 @@ class Proxy:
                 asyncio.ensure_future(self._resolve_quiet(n))
         for idx, cand in enumerate(candidates):
             last = idx == len(candidates) - 1
-            route = None if self.args.upstream_ip else self._mem_get(self.routes, cand)
+            cacheable = not self.args.upstream_ip and cand != self.args.fallback_host
+            route = self._mem_get(self.routes, cand) if cacheable else None
             if route:
                 r_name, r_ip = route
                 if self._is_loopback(r_ip) or self._is_dead_ip(r_ip):
@@ -1431,7 +1444,7 @@ class Proxy:
                     # a route that worked recently: no DNS, no search over the other names, just connect
                     try:
                         ur, uw, up_host, ip = await asyncio.wait_for(
-                            self._race_connect([(r_name, r_ip)]), ROUTE_FAST_TIMEOUT)
+                            self._race_connect([(r_name, r_ip)]), self.fast_timeout())
                     except (OSError, ssl.SSLError, asyncio.TimeoutError):
                         self.routes.pop(cand, None)
                         self.stats["route_stale"] += 1
@@ -1480,7 +1493,7 @@ class Proxy:
                 continue
             self.bad.pop((up_host, ip), None)
             self.stats["cold"] += 1
-            if not self.args.upstream_ip:
+            if cacheable:
                 self._mem_put(self.routes, cand, up_host, ip)
             if time.monotonic() - t_conn > 1.0 or up_host != cand:
                 log(f"connect to {cand}: {time.monotonic() - t_conn:.1f}s, connected via {up_host} [{ip}]")
@@ -1490,10 +1503,10 @@ class Proxy:
 
     # ------------------------------------------------------------ one request/response exchange
     @staticmethod
-    async def read_resp_head(ur):
+    async def read_resp_head(ur, timeout=RESP_HEAD_TIMEOUT):
         """Response head from the node, or None if it closed / reset / stayed silent."""
         try:
-            return await asyncio.wait_for(ur.readuntil(b"\r\n\r\n"), RESP_HEAD_TIMEOUT)
+            return await asyncio.wait_for(ur.readuntil(b"\r\n\r\n"), timeout)
         except (asyncio.IncompleteReadError, asyncio.LimitOverrunError, asyncio.TimeoutError, OSError):
             return None
 
@@ -1626,7 +1639,7 @@ class Proxy:
             else:
                 if stream is not None:
                     await stream(uw)  # client-side errors propagate and close the connection
-                resp = await self.read_resp_head(ur)
+                resp = await self.read_resp_head(ur, RESP_HEAD_TIMEOUT if fresh else STALE_HEAD_TIMEOUT)
             if resp is None:
                 log(f"no answer from {up_host}" + ("" if fresh else " (stale keep-alive, reconnecting)"))
                 if fresh:  # a stale keep-alive proves nothing about the route; a fresh connection that is silent does
@@ -1730,10 +1743,22 @@ class Proxy:
                 if cur and reuse is None:
                     self.put_pooled(cur[2], cur[0], cur[1])  # still clean: another client connection can use it
                 cur = None
-                if reuse is None and stream is None:
-                    reuse = self.take_pooled(grp)
+                if reuse is None and stream is None and urlsplit(target).path == "/videoplayback":
+                    reuse = self.take_pooled(grp)  # (small probes like generate_204 always use a fresh connection)
 
                 res = await self.exchange(head, candidates, body, stream, reuse, host)
+                if res is None and urlsplit(target).path == "/generate_204" and method in ("GET", "HEAD"):
+                    # Connectivity probe: its answer is an empty 204 anyway. If no node could be reached for it, answer
+                    # it here instead of dropping the connection (ERR_EMPTY_RESPONSE) - the real requests that follow
+                    # (/videoplayback) are still sent to working nodes.
+                    log(f"{host}: no node reachable for /generate_204 -> answered 204 locally")
+                    origin = headers.get("origin", "")
+                    cors = (f"Access-Control-Allow-Origin: {origin}\r\nAccess-Control-Allow-Credentials: true\r\n"
+                            f"Timing-Allow-Origin: {origin}\r\nVary: Origin\r\n") if origin and "\r" not in origin and "\n" not in origin else ""
+                    writer.write(("HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n" + cors +
+                                  "Cache-Control: no-cache, no-store, must-revalidate\r\nConnection: keep-alive\r\n\r\n").encode())
+                    await writer.drain()
+                    continue
                 if res is None:
                     log(f"no upstream for {host}: every candidate failed (the browser will retry)")
                     break
